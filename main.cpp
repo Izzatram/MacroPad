@@ -1,183 +1,264 @@
+// main.cpp - Polished Macropad firmware
+// - Matrix: ROW 25, COLs: 26,27,32
+// - Encoder: CLK=14, DT=16, SW=13
+// - Battery: ADC pin 33 (adjust if needed)
+// - BLE HID keyboard with battery level
+
 #include <Arduino.h>
 #include <BleKeyboard.h>
 #include <RotaryEncoder.h>
 #include "nvs_flash.h"
 
-// ========== BLE Keyboard ==========
+// ----- BLE -----
 BleKeyboard bleKeyboard("Macropad", "YourCompany", 100);
 
-// ========== Pin Definitions ==========
+// ----- Pins (match your wiring) -----
 #define ROW_PIN         25
-#define COL0_PIN        26
+#define COL0_PIN        32
 #define COL1_PIN        27
-#define COL2_PIN        32
+#define COL2_PIN        26
 
 #define ENC_CLK         14
-#define ENC_DT          12
+#define ENC_DT          16
 #define ENC_SW          13
 
 #define LED_STATUS      4
 
 #define BAT_CHARGE_PIN  34
 #define BAT_FULL_PIN    35
+#define BAT_ADC_PIN     33
 
-// ========== Globals ==========
-bool profile = 0;  // 0 = Profile 1, 1 = Profile 2
+// ----- Globals -----
+const uint8_t columnPins[3] = {COL0_PIN, COL1_PIN, COL2_PIN};
+bool keyState[3] = {false, false, false};
+unsigned long lastDebounceTime[3] = {0, 0, 0};
+const unsigned long debounceDelay = 50;
+
+bool profile = 0; // 0 or 1
 unsigned long switch1_press_time = 0;
 bool switch1_long_press_triggered = false;
 
 RotaryEncoder encoder(ENC_DT, ENC_CLK, RotaryEncoder::LatchMode::TWO03);
 int lastEncoderPos = 0;
 
-// Key matrix state
-const uint8_t columnPins[3] = {COL0_PIN, COL1_PIN, COL2_PIN};
-bool keyState[3] = {false, false, false};
-const unsigned long debounceDelay = 50;
-unsigned long lastDebounceTime[3] = {0, 0, 0};
-
-// ========== Utility ==========
+// ----- Utility -----
 void resetBLE() {
-  Serial.println("Resetting BLE pairing info...");
-  nvs_flash_erase();   // Erase NVS
-  nvs_flash_init();    // Re-init NVS
-  ESP.restart();       // Restart ESP32
+  Serial.println("Resetting BLE pairing info (erasing NVS)...");
+  nvs_flash_erase();
+  nvs_flash_init();
+  ESP.restart();
 }
 
-// ========== Matrix Scanning ==========
-void scanKeys() {
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(columnPins[i], LOW);
-    delayMicroseconds(5);
+void indicateProfile() {
+  // 1 blink -> profile 0, 2 blinks -> profile 1
+  int blinks = profile ? 2 : 1;
+  for (int i = 0; i < blinks; ++i) {
+    digitalWrite(LED_STATUS, HIGH);
+    delay(150);
+    digitalWrite(LED_STATUS, LOW);
+    delay(150);
+  }
+}
 
-    bool pressed = !digitalRead(ROW_PIN); // active low
+// ----- Battery -----
+int readBatteryPercent() {
+  // Read ADC and convert to battery percent.
+  // Adjust the voltage mapping if your divider or battery chemistry differs.
+  const float vmin = 3.0f; // 0%
+  const float vmax = 4.2f; // 100%
+  int raw = analogRead(BAT_ADC_PIN);              // 0..4095
+  float vadc = (raw / 4095.0f) * 3.3f;            // V at ADC input
+  float batteryV = vadc * 2.0f;                   // if using 2:1 divider
+  int pct = (int)round((batteryV - vmin) / (vmax - vmin) * 100.0f);
+  pct = constrain(pct, 0, 100);
+  return pct;
+}
+
+void reportBatteryToHost() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < 1000) return; // every 1s
+  last = now;
+  int pct = readBatteryPercent();
+  bleKeyboard.setBatteryLevel(pct);
+  // Also print to Serial for debugging
+  Serial.print("Battery: ");
+  Serial.print(pct);
+  Serial.print("%  (V=");
+  float raw = analogRead(BAT_ADC_PIN);
+  float batteryV = (raw / 4095.0f) * 3.3f * 2.0f;
+  Serial.print(batteryV, 2);
+  Serial.println("V)");
+}
+
+// ----- Matrix scanning -----
+void scanKeys() {
+  for (int col = 0; col < 3; ++col) {
+    // set all columns HIGH then pull active LOW
+    for (int j = 0; j < 3; ++j) digitalWrite(columnPins[j], HIGH);
+    digitalWrite(columnPins[col], LOW);
+
+    delay(1); // allow IO to settle (1 ms is safe)
+
+    bool pressed = (digitalRead(ROW_PIN) == LOW); // active low
     unsigned long now = millis();
 
-    if (pressed != keyState[i] && (now - lastDebounceTime[i]) > debounceDelay) {
-      keyState[i] = pressed;
-      lastDebounceTime[i] = now;
+    if (pressed != keyState[col] && (now - lastDebounceTime[col]) > debounceDelay) {
+      keyState[col] = pressed;
+      lastDebounceTime[col] = now;
 
       if (pressed) {
-        switch (i) {
-          case 0:  // Switch 1
+        Serial.printf("Key %d PRESSED\n", col);
+        // on press actions
+        switch (col) {
+          case 0:
+            // start timing for long press
             switch1_press_time = now;
             switch1_long_press_triggered = false;
             break;
-
-          case 1:  // Switch 2
+          case 1:
             if (profile == 0) {
               bleKeyboard.write(KEY_LEFT_ARROW);
+              Serial.println("Action: LEFT ARROW");
             } else {
               bleKeyboard.write(KEY_MEDIA_MUTE);
+              Serial.println("Action: MUTE");
             }
             break;
-
-          case 2:  // Switch 3
-            bleKeyboard.write(KEY_RIGHT_ARROW); // same in both profiles
+          case 2:
+            bleKeyboard.write(KEY_RIGHT_ARROW);
+            Serial.println("Action: RIGHT ARROW");
             break;
         }
       } else {
-        // On release
-        if (i == 0) {
-          unsigned long pressDuration = now - switch1_press_time;
-          if (pressDuration > 1000) {
+        Serial.printf("Key %d RELEASED\n", col);
+        // on release actions
+        if (col == 0) {
+          unsigned long duration = now - switch1_press_time;
+          if (duration > 1000) {
             if (!switch1_long_press_triggered) {
               switch1_long_press_triggered = true;
+              Serial.println("Long press detected -> resetting BLE");
               resetBLE();
             }
           } else {
-            // Short press: switch profile
             profile = !profile;
-            Serial.print("Switched to profile: ");
-            Serial.println(profile);
+            Serial.print("Profile toggled -> ");
+            Serial.println(profile ? "1" : "0");
+            indicateProfile();
           }
         }
       }
     }
 
-    digitalWrite(columnPins[i], HIGH);
+    // return column to idle HIGH
+    digitalWrite(columnPins[col], HIGH);
   }
 }
 
-// ========== Encoder Handling ==========
+// ----- Encoder handling -----
 void handleEncoder() {
   encoder.tick();
-  int newPos = encoder.getPosition();
+  int pos = encoder.getPosition();
 
-  if (newPos != lastEncoderPos) {
-    if (newPos > lastEncoderPos) {
-      // Clockwise
+  if (pos != lastEncoderPos) {
+    if (pos > lastEncoderPos) {
+      // CW
       if (profile == 0) {
         bleKeyboard.write(KEY_MEDIA_VOLUME_UP);
+        Serial.println("Encoder CW -> VOL UP");
       } else {
         bleKeyboard.write(KEY_MEDIA_NEXT_TRACK);
+        Serial.println("Encoder CW -> NEXT TRACK");
       }
     } else {
-      // Counter-clockwise
+      // CCW
       if (profile == 0) {
         bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);
+        Serial.println("Encoder CCW -> VOL DOWN");
       } else {
         bleKeyboard.write(KEY_MEDIA_PREVIOUS_TRACK);
+        Serial.println("Encoder CCW -> PREV TRACK");
       }
     }
-    lastEncoderPos = newPos;
+    lastEncoderPos = pos;
   }
 
-  // Handle encoder button (play/pause)
   static bool lastSW = HIGH;
-  bool currentSW = digitalRead(ENC_SW);
-
-  if (lastSW == HIGH && currentSW == LOW) {
-    delay(10);  // debounce
+  bool curSW = digitalRead(ENC_SW);
+  if (lastSW == HIGH && curSW == LOW) {
+    delay(12); // small debounce
     if (digitalRead(ENC_SW) == LOW) {
       bleKeyboard.write(KEY_MEDIA_PLAY_PAUSE);
+      Serial.println("Encoder button -> PLAY/PAUSE");
     }
   }
-
-  lastSW = currentSW;
+  lastSW = curSW;
 }
 
-// ========== Battery LED ==========
+// ----- Battery LED -----
 void handleBatteryLED() {
-  int charge = digitalRead(BAT_CHARGE_PIN);  // 0 = charging
-  int full = digitalRead(BAT_FULL_PIN);      // 0 = full
+  int charge = digitalRead(BAT_CHARGE_PIN); // 0 = charging (depends on your hardware)
+  int full = digitalRead(BAT_FULL_PIN);     // 0 = full (depends on your hardware)
 
   if (full == 0) {
-    digitalWrite(LED_STATUS, HIGH); // ON (full)
+    digitalWrite(LED_STATUS, HIGH); // solid on = full
   } else if (charge == 0) {
-    digitalWrite(LED_STATUS, millis() % 1000 < 500); // Blink (charging)
+    // blink while charging
+    digitalWrite(LED_STATUS, (millis() % 1000) < 500 ? HIGH : LOW);
   } else {
-    digitalWrite(LED_STATUS, LOW); // Off (idle)
+    digitalWrite(LED_STATUS, LOW);
   }
 }
 
-// ========== Setup ==========
+// ----- Setup & Loop -----
 void setup() {
   Serial.begin(115200);
+  delay(10);
+  Serial.println();
+  Serial.println("Macropad starting...");
 
-  // Matrix setup
+  // matrix
   pinMode(ROW_PIN, INPUT_PULLUP);
-  for (uint8_t i = 0; i < 3; i++) {
+  for (int i = 0; i < 3; ++i) {
     pinMode(columnPins[i], OUTPUT);
-    digitalWrite(columnPins[i], HIGH);
+    digitalWrite(columnPins[i], HIGH); // idle HIGH
   }
 
-  // Encoder
+  // encoder
   pinMode(ENC_SW, INPUT_PULLUP);
   encoder.setPosition(0);
 
-  // Battery LED and status
+  // LED + battery pins
   pinMode(LED_STATUS, OUTPUT);
   pinMode(BAT_CHARGE_PIN, INPUT_PULLUP);
   pinMode(BAT_FULL_PIN, INPUT_PULLUP);
+  pinMode(BAT_ADC_PIN, INPUT); // ADC
 
-  // Start BLE
+  // ADC resolution (optional)
+  analogReadResolution(12); // 0..4095
+
+  // BLE
   bleKeyboard.begin();
+  Serial.println("BLE initialized; waiting for host");
 }
 
-// ========== Main Loop ==========
 void loop() {
+  // Always scan and handle encoder so they are responsive
   scanKeys();
   handleEncoder();
+
+  // update LED and battery
   handleBatteryLED();
-  delay(5);  // small delay for stability
+  reportBatteryToHost();
+
+  // debug BLE status occasionally
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug > 2000) {
+    lastDebug = millis();
+    if (bleKeyboard.isConnected()) Serial.println("BLE connected");
+    else Serial.println("BLE advertising...");
+  }
+
+  delay(5); // small giveback
 }
